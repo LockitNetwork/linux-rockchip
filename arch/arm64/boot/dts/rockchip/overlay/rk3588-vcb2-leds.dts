@@ -1,0 +1,126 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/leds/common.h>
+
+/ {
+	compatible = "rockchip,rk3588";
+
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			pwmledscolor_wifi {
+				compatible = "pwm-leds-multicolor";
+
+				multi-led {
+					label = "wifi";
+					color = <LED_COLOR_ID_RGB>;
+					function = LED_FUNCTION_INDICATOR;
+					max-brightness = <255>;
+
+					a_led-red {
+						pwms = <&pwm7 0 7812500 0>;
+						color = <LED_COLOR_ID_RED>;
+					};
+
+					b_led-green {
+						pwms = <&pwm15 0 7812500 0>;
+						color = <LED_COLOR_ID_GREEN>;
+					};
+
+					c_led-blue {
+						pwms = <&pwm13 0 7812500 0>;
+						color = <LED_COLOR_ID_BLUE>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/";
+
+		__overlay__ {
+			pwmledscolor_status {
+				compatible = "pwm-leds-multicolor";
+
+				multi-led {
+					label = "status";
+					color = <LED_COLOR_ID_RGB>;
+					function = LED_FUNCTION_INDICATOR;
+					max-brightness = <255>;
+
+					a_led-red {
+						pwms = <&pwm8 0 7812500 0>;
+						color = <LED_COLOR_ID_RED>;
+					};
+
+					b_led-green {
+						pwms = <&pwm14 0 7812500 0>;
+						color = <LED_COLOR_ID_GREEN>;
+					};
+
+					c_led-blue {
+						pwms = <&pwm3 0 7812500 0>;
+						color = <LED_COLOR_ID_BLUE>;
+					};
+				};
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <&pwm7>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <&pwm7m3_pins>;
+		};
+	};
+
+	fragment@3 {
+		target = <&pwm15>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <&pwm15m3_pins>;
+		};
+	};
+
+	fragment@4 {
+		target = <&pwm13>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <&pwm13m2_pins>;
+		};
+	};
+
+	fragment@5 {
+		target = <&pwm8>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <&pwm8m0_pins>;
+		};
+	};
+
+	fragment@6 {
+		target = <&pwm14>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <&pwm14m1_pins>;
+		};
+	};
+
+	fragment@7 {
+		target = <&pwm3>;
+
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <&pwm3m1_pins>;
+		};
+	};
+};

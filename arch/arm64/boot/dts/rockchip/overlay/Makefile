@@ -199,7 +199,9 @@ dtbo-$(CONFIG_ARCH_ROCKCHIP) += \
 	rk3588-uart8-m1.dtbo \
 	rk3588-w1-gpio3-b3.dtbo \
 	rk3588-w1-gpio4-b1.dtbo \
-	rk3588-hdmirx.dtbo
+	rk3588-hdmirx.dtbo \
+	rk3588-vcb2-leds.dtbo \
+	rk3588-vcb2-pm.dtbo
 
 
 dtbotxt-$(CONFIG_ARCH_ROCKCHIP) += \

@@ -3427,11 +3427,6 @@
 					 <&cru HCLK_NVM_ROOT>;
 				pm_qos = <&qos_sdio>;
 			};
-			power-domain@RK3588_PD_AUDIO {
-				reg = <RK3588_PD_AUDIO>;
-				clocks = <&cru HCLK_AUDIO_ROOT>,
-					 <&cru PCLK_AUDIO_ROOT>;
-			};
 			power-domain@RK3588_PD_SDMMC {
 				reg = <RK3588_PD_SDMMC>;
 				pm_qos = <&qos_sdmmc>;

@@ -509,7 +509,7 @@
 };
 
 &i2s0_8ch {
-	status = "okay";
+	status = "disabled";
 	pinctrl-0 = <&i2s0_lrck
 		     &i2s0_sclk
 		     &i2s0_sdi0

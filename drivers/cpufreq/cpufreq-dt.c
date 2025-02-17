@@ -6,7 +6,7 @@
  * Viresh Kumar <viresh.kumar@linaro.org>
  */
 
-#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/clk.h>
 #include <linux/cpu.h>
@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/pm_opp.h>
+#include <linux/pm_qos.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -41,7 +42,7 @@ static LIST_HEAD(priv_list);
 
 static struct freq_attr *cpufreq_dt_attr[] = {
 	&cpufreq_freq_attr_scaling_available_freqs,
-	NULL,   /* Extra space for boost-attr if required */
+	NULL, /* Extra space for boost-attr if required */
 	NULL,
 };
 
@@ -65,6 +66,7 @@ static int set_target(struct cpufreq_policy *policy, unsigned int index)
 #ifdef CONFIG_ARCH_ROCKCHIP
 	return rockchip_cpufreq_opp_set_rate(priv->cpu_dev, freq * 1000);
 #else
+	printk(KERN_INFO "cpufreq-dt: setting frequency to %lu\n", freq * 1000);
 	return dev_pm_opp_set_rate(priv->cpu_dev, freq * 1000);
 #endif
 }
@@ -141,6 +143,13 @@ static int cpufreq_init(struct cpufreq_policy *policy)
 	policy->cpuinfo.transition_latency = transition_latency;
 	policy->dvfs_possible_from_any_cpu = true;
 
+	printk(KERN_INFO "cpufreq-dt: %s: policy->suspend_freq = %d\n",
+	       __func__, policy->suspend_freq);
+	ret = freq_qos_update_request(policy->max_freq_req, 1200000);
+	printk(KERN_INFO
+	       "cpufreq-dt: %s: freq_qos_update_request(policy->max_freq_req, 1200000) = %d\n",
+	       __func__, ret);
+
 	/* Support turbo/boost mode */
 	if (policy_has_boost_freq(policy)) {
 		/* This gets disabled by core on driver unregister */
@@ -180,8 +189,7 @@ static int cpufreq_exit(struct cpufreq_policy *policy)
 }
 
 static struct cpufreq_driver dt_cpufreq_driver = {
-	.flags = CPUFREQ_NEED_INITIAL_FREQ_CHECK |
-		 CPUFREQ_IS_COOLING_DEV,
+	.flags = CPUFREQ_NEED_INITIAL_FREQ_CHECK | CPUFREQ_IS_COOLING_DEV,
 	.verify = cpufreq_generic_frequency_table_verify,
 	.target_index = set_target,
 	.get = cpufreq_generic_get,
@@ -283,7 +291,8 @@ static int dt_cpufreq_early_init(struct device *dev, int cpu)
 		cpumask_setall(priv->cpus);
 		ret = dev_pm_opp_set_sharing_cpus(cpu_dev, priv->cpus);
 		if (ret)
-			dev_err(cpu_dev, "%s: failed to mark OPPs as shared: %d\n",
+			dev_err(cpu_dev,
+				"%s: failed to mark OPPs as shared: %d\n",
 				__func__, ret);
 	}
 
@@ -337,14 +346,17 @@ static int dt_cpufreq_probe(struct platform_device *pdev)
 
 	if (data) {
 		if (data->have_governor_per_policy)
-			dt_cpufreq_driver.flags |= CPUFREQ_HAVE_GOVERNOR_PER_POLICY;
+			dt_cpufreq_driver.flags |=
+				CPUFREQ_HAVE_GOVERNOR_PER_POLICY;
 
 		dt_cpufreq_driver.resume = data->resume;
 		if (data->suspend)
 			dt_cpufreq_driver.suspend = data->suspend;
 		if (data->get_intermediate) {
-			dt_cpufreq_driver.target_intermediate = data->target_intermediate;
-			dt_cpufreq_driver.get_intermediate = data->get_intermediate;
+			dt_cpufreq_driver.target_intermediate =
+				data->target_intermediate;
+			dt_cpufreq_driver.get_intermediate =
+				data->get_intermediate;
 		}
 	}
 

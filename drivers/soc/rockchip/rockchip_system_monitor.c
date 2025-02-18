@@ -31,6 +31,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/delay.h>
+#include <linux/cpumask.h>
 #include <soc/rockchip/rockchip_opp_select.h>
 #include <soc/rockchip/rockchip_sip.h>
 #include <soc/rockchip/rockchip_system_monitor.h>
@@ -46,6 +47,9 @@
 #define CPU_REBOOT_FREQ		816000 /* kHz */
 #define VIDEO_1080P_SIZE	(1920 * 1080)
 #define THERMAL_POLLING_DELAY	200 /* milliseconds */
+
+#define CUSTOM_POLICY_NUM_CONSTRAINTS 2
+#define CUSTOM_POLICY_INIT_FREQ 1200000
 
 struct video_info {
 	unsigned int width;
@@ -102,6 +106,9 @@ static atomic_t monitor_in_suspend;
 
 static BLOCKING_NOTIFIER_HEAD(system_monitor_notifier_list);
 static BLOCKING_NOTIFIER_HEAD(system_status_notifier_list);
+
+static struct freq_qos_request custom_max_freq_reqs[CUSTOM_POLICY_NUM_CONSTRAINTS];
+static int custom_max_freq_reqs_idx = 0;
 
 #ifdef CONFIG_ROCKCHIP_EARLYSUSPEND
 static DEFINE_MUTEX(early_suspend_mutex);
@@ -1371,6 +1378,9 @@ rockchip_system_monitor_register(struct device *dev,
 				 struct monitor_dev_profile *devp)
 {
 	struct monitor_dev_info *info;
+	struct cpufreq_policy *policy;
+	unsigned int first_cpu;
+	int ret;
 
 	if (!system_monitor)
 		return ERR_PTR(-ENOMEM);
@@ -1399,6 +1409,24 @@ rockchip_system_monitor_register(struct device *dev,
 	rockchip_system_monitor_wide_temp_init(info);
 	rockchip_system_monitor_check_rate_volt(info);
 	rockchip_system_monitor_freq_qos_requset(info);
+
+	first_cpu = cpumask_first(&devp->allowed_cpus);
+
+	if (first_cpu >= 4 && 
+    devp->type == MONITOR_TYPE_CPU &&
+    custom_max_freq_reqs_idx < CUSTOM_POLICY_NUM_CONSTRAINTS) {
+
+    // Add custom max freq limit
+    policy = (struct cpufreq_policy *)devp->data;
+    ret = freq_qos_add_request(&policy->constraints,
+                               &custom_max_freq_reqs[custom_max_freq_reqs_idx++],
+                               FREQ_QOS_MAX,
+                               CUSTOM_POLICY_INIT_FREQ);
+
+    printk(KERN_INFO "custom_max_freq_req: %d, freq: %d\n", ret,
+           custom_max_freq_reqs[custom_max_freq_reqs_idx - 1]
+           .qos->max_freq.target_value);
+	}
 
 	down_write(&mdev_list_sem);
 	list_add(&info->node, &monitor_dev_list);
@@ -1435,6 +1463,25 @@ void rockchip_system_monitor_unregister(struct monitor_dev_info *info)
 	kfree(info);
 }
 EXPORT_SYMBOL(rockchip_system_monitor_unregister);
+
+int rockchip_system_monitor_set_custom_max_freq(s32 freq) {
+  int ret;
+  int i;
+
+  for (i = 0; i < custom_max_freq_reqs_idx; i++) {
+    printk(KERN_INFO "custom freq_qos_update_request: %d, freq: %d\n", i, freq);
+
+    ret = freq_qos_update_request(&custom_max_freq_reqs[i], freq);
+    if (ret < 0) {
+      printk(KERN_ERR "failed to update freq_qos: %d\n", ret);
+      return ret;
+    }
+  }
+
+  return 0;
+}
+
+EXPORT_SYMBOL(rockchip_system_monitor_set_custom_max_freq);
 
 int rockchip_system_monitor_register_notifier(struct notifier_block *nb)
 {

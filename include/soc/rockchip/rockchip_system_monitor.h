@@ -151,6 +151,7 @@ int rockchip_monitor_dev_high_temp_adjust(struct monitor_dev_info *info,
 int rockchip_monitor_suspend_low_temp_adjust(int cpu);
 int rockchip_system_monitor_register_notifier(struct notifier_block *nb);
 void rockchip_system_monitor_unregister_notifier(struct notifier_block *nb);
+int rockchip_system_monitor_set_custom_max_freq(s32 freq);
 #else
 static inline struct monitor_dev_info *
 rockchip_system_monitor_register(struct device *dev,

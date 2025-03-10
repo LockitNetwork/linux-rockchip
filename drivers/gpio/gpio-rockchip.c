@@ -294,6 +294,10 @@ static int rockchip_gpio_set_config(struct gpio_chip *gc, unsigned int offset,
 	enum pin_config_param param = pinconf_to_config_param(config);
 
 	switch (param) {
+	case PIN_CONFIG_BIAS_DISABLE:
+	case PIN_CONFIG_BIAS_PULL_UP:
+	case PIN_CONFIG_BIAS_PULL_DOWN:
+		return gpiochip_generic_config(gc, offset, config);
 	case PIN_CONFIG_INPUT_DEBOUNCE:
 		rockchip_gpio_set_debounce(gc, offset, 0);
 		/*

@@ -1,0 +1,734 @@
+/*
+* Viviana Cloud Box 2 Power Management Driver
+*/
+
+#include <linux/types.h>
+#include <linux/module.h>
+#include <linux/device.h>
+#include <linux/serdev.h>
+#include <linux/power_supply.h>
+#include <linux/of_device.h>
+#include <linux/reboot.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+#include <linux/cpufreq.h>
+#include <linux/pm_qos.h>
+#include <soc/rockchip/rockchip_system_monitor.h>
+
+#define PM_STATUS_CACHE_PERIOD_MS 100
+
+#define SERIAL_BAUDRATE 115200
+#define SERIAL_TIMEOUT_MS 1000
+
+#define GRACEFUL_SHUTDOWN_MS 20000
+
+#define CPUFREQ_MAX_FREQ_HIGH 2400000
+#define CPUFREQ_MAX_FREQ_LOW 1200000
+
+enum vcb2_pm_charge_status {
+	CHARGE_STATUS_NOT_CHARGING,
+	CHARGE_STATUS_CHARGING,
+	CHARGE_STATUS_FULL,
+};
+
+struct vcb2_pm_status {
+	enum vcb2_pm_charge_status charge_status;
+	u16 bat_voltage;
+	u16 bat_current;
+	u8 bat_percent;
+	bool online;
+};
+
+void vcb2_pm_status_init(struct vcb2_pm_status *status)
+{
+	status->online = false;
+	status->charge_status = CHARGE_STATUS_NOT_CHARGING;
+	status->bat_percent = 0;
+	status->bat_voltage = 0;
+	status->bat_current = 0;
+}
+
+struct vcb2_pm_status_parser {
+	enum {
+		PARSER_STATE_INIT,
+		PARSER_STATE_SHUTDOWN_CONFIRM,
+		PARSER_STATE_PING_CONFIRM,
+		PARSER_STATE_EXT_POWER_UP_CONFIRM,
+		PARSER_STATE_EXT_POWER_DOWN_CONFIRM,
+		PARSER_STATE_CHARGE_STATUS,
+		PARSER_STATE_PERCENT,
+		PARSER_STATE_VOLTAGE,
+		PARSER_STATE_CURRENT,
+	} state;
+
+	struct vcb2_pm_status status;
+};
+
+static void vcb2_pm_status_parser_init(struct vcb2_pm_status_parser *p)
+{
+	p->state = PARSER_STATE_INIT;
+	vcb2_pm_status_init(&p->status);
+}
+
+enum vcb2_pm_poll_state {
+	POLL_STATE_IN_PROGRESS,
+	POLL_STATE_COMPLETED,
+	POLL_STATE_ERROR,
+};
+
+struct vcb2_pm_device_info {
+	struct serdev_device *serdev;
+	struct power_supply *psy;
+
+	struct mutex lock;
+	wait_queue_head_t wq; /* Wait queue for poll completion */
+
+	u64 poll_time; /* Last time a poll was requested or received
+                        * (depending on poll_state)
+                        */
+
+	struct timer_list graceful_shutdown_timer;
+
+	enum vcb2_pm_poll_state poll_state;
+	struct vcb2_pm_status_parser status_parser;
+	struct vcb2_pm_status pm_status;
+
+	bool was_polled;
+	bool shutdown_requested;
+};
+
+static void vcb2_pm_di_init(struct vcb2_pm_device_info *di)
+{
+	di->serdev = NULL;
+	di->psy = NULL;
+	di->poll_state = POLL_STATE_ERROR;
+	di->poll_time = 0;
+	di->was_polled = false;
+	di->shutdown_requested = false;
+
+	mutex_init(&di->lock);
+	init_waitqueue_head(&di->wq);
+	vcb2_pm_status_parser_init(&di->status_parser);
+	vcb2_pm_status_init(&di->pm_status);
+}
+
+static int parse_charge_status(char c)
+{
+	switch (c) {
+	case 'n':
+		return CHARGE_STATUS_NOT_CHARGING;
+	case 'c':
+		return CHARGE_STATUS_CHARGING;
+	case 'f':
+		return CHARGE_STATUS_FULL;
+	}
+	return -1;
+}
+
+enum vcb2_pm_status_parser_ret {
+	PARSER_RET_COMPLETE_STATUS,
+	PARSER_RET_COMPLETE_SHUTDOWN_REQUEST,
+	PARSER_RET_COMPLETE_PING,
+	PARSER_RET_COMPLETE_EXT_POWER_UP,
+	PARSER_RET_COMPLETE_EXT_POWER_DOWN,
+	PARSER_RET_INCOMPLETE,
+	PARSER_RET_ERROR,
+};
+
+/*
+ * Simple state machine parser for the serial messages from PM.
+ * 
+ * Gramma (PEG):
+ * message <- (power_status / shutdown_request / ext_power_up / ext_power_down / ping) '\n'
+ * power_status <- online charge_status bat_percent ',' voltage ',' current
+ * shutdown_request <- 's'
+ * ping <- 'p'
+ * online <- '0' / '1'
+ * charge_status <- 'n' / 'c' / 'f'
+ * bat_percent <- uint
+ * voltage <- uint
+ * current <- uint
+ * ext_power_up <- '+'
+ * ext_power_down <- '-'
+ * uint <- [0-9]*
+ * 
+ * Numerical values are not validated. Values outside of the allowed
+ * range are subject to unsigned integer overflow.
+ * Empty numerical values are treated as 0.
+ */
+static enum vcb2_pm_status_parser_ret
+vcb2_pm_status_parser_feed(struct vcb2_pm_status_parser *p, const char c)
+{
+	enum vcb2_pm_status_parser_ret ret = PARSER_RET_INCOMPLETE;
+	int charge_status;
+
+	switch (p->state) {
+	case PARSER_STATE_INIT:
+		switch (c) {
+		case '0':
+			vcb2_pm_status_init(&p->status);
+			p->status.online = false;
+			p->state = PARSER_STATE_CHARGE_STATUS;
+			break;
+		case '1':
+			vcb2_pm_status_init(&p->status);
+			p->status.online = true;
+			p->state = PARSER_STATE_CHARGE_STATUS;
+			break;
+		case 's':
+			p->state = PARSER_STATE_SHUTDOWN_CONFIRM;
+			break;
+		case 'p':
+			p->state = PARSER_STATE_PING_CONFIRM;
+			break;
+		case '+':
+			p->state = PARSER_STATE_EXT_POWER_UP_CONFIRM;
+			break;
+		case '-':
+			p->state = PARSER_STATE_EXT_POWER_DOWN_CONFIRM;
+			break;
+		default:
+			ret = PARSER_RET_ERROR;
+		}
+		break;
+	case PARSER_STATE_SHUTDOWN_CONFIRM:
+		if (c == '\n')
+			ret = PARSER_RET_COMPLETE_SHUTDOWN_REQUEST;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_PING_CONFIRM:
+		if (c == '\n')
+			ret = PARSER_RET_COMPLETE_PING;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_EXT_POWER_UP_CONFIRM:
+		if (c == '\n')
+			ret = PARSER_RET_COMPLETE_EXT_POWER_UP;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_EXT_POWER_DOWN_CONFIRM:
+		if (c == '\n')
+			ret = PARSER_RET_COMPLETE_EXT_POWER_DOWN;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_CHARGE_STATUS:
+		charge_status = parse_charge_status(c);
+		if (charge_status < 0) {
+			ret = PARSER_RET_ERROR;
+		} else {
+			p->status.charge_status = charge_status;
+			p->state = PARSER_STATE_PERCENT;
+		}
+		break;
+	case PARSER_STATE_PERCENT:
+		if (c >= '0' && c <= '9')
+			p->status.bat_percent =
+				(p->status.bat_percent * 10) + (u8)(c - '0');
+		else if (c == ',')
+			p->state = PARSER_STATE_VOLTAGE;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_VOLTAGE:
+		if (c >= '0' && c <= '9')
+			p->status.bat_voltage =
+				(p->status.bat_voltage * 10) + (u16)(c - '0');
+		else if (c == ',')
+			p->state = PARSER_STATE_CURRENT;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_CURRENT:
+		if (c >= '0' && c <= '9')
+			p->status.bat_current =
+				(p->status.bat_current * 10) + (u16)(c - '0');
+		else if (c == '\n')
+			ret = PARSER_RET_COMPLETE_STATUS;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	}
+
+	if (ret != PARSER_RET_INCOMPLETE)
+		p->state = PARSER_STATE_INIT;
+
+	return ret;
+}
+
+static int cpufreq_set_max_freq(u32 max_freq_khz)
+{
+	int ret = rockchip_system_monitor_set_custom_max_freq(max_freq_khz);
+	printk("VCB2-PM: set CPU freq to %d, ret %d\n", max_freq_khz, ret);
+
+	return ret;
+}
+
+static inline bool
+vcb2_pm_is_poll_in_progress_unlocked(struct vcb2_pm_device_info *di)
+{
+	WARN_ON(!mutex_is_locked(&di->lock));
+
+	return di->poll_state == POLL_STATE_IN_PROGRESS &&
+	       time_is_after_jiffies64(di->poll_time +
+				       msecs_to_jiffies(SERIAL_TIMEOUT_MS));
+}
+
+static inline bool
+vcb2_pm_has_cached_status_unlocked(struct vcb2_pm_device_info *di)
+{
+	WARN_ON(!mutex_is_locked(&di->lock));
+
+	return di->poll_state == POLL_STATE_COMPLETED &&
+	       time_is_after_jiffies64(
+		       di->poll_time +
+		       msecs_to_jiffies(PM_STATUS_CACHE_PERIOD_MS));
+}
+
+static void run_userspace_poweroff(struct timer_list *timer)
+{
+	static char *shutdown_argv[] = { "/sbin/poweroff", NULL };
+	printk("vcb2-pm - grace period ended; shutting down...\n");
+	call_usermodehelper(shutdown_argv[0], shutdown_argv, NULL, UMH_NO_WAIT);
+}
+
+/*
+ * Singals the shutdown request via sysfs attr "shutdown_requested".
+ * If the system is still running after GRACEFUL_SHUTDOWN_MS a userspace
+ * poweroff command is issued.
+ */
+static void initiate_shutdown_unlocked(struct vcb2_pm_device_info *di)
+{
+	WARN_ON(!mutex_is_locked(&di->lock));
+
+	if (di->shutdown_requested)
+		return;
+
+	di->shutdown_requested = true;
+	timer_setup(&di->graceful_shutdown_timer, run_userspace_poweroff, 0);
+	mod_timer(&di->graceful_shutdown_timer,
+		  jiffies + msecs_to_jiffies(GRACEFUL_SHUTDOWN_MS));
+}
+
+static int vcb2_pm_await_poll_response(struct vcb2_pm_device_info *di,
+				       struct vcb2_pm_status *status)
+{
+	long ret;
+
+	mutex_lock(&di->lock);
+	while (di->poll_state == POLL_STATE_IN_PROGRESS) {
+		mutex_unlock(&di->lock);
+		ret = wait_event_timeout(
+			di->wq, di->poll_state != POLL_STATE_IN_PROGRESS,
+			msecs_to_jiffies(SERIAL_TIMEOUT_MS));
+
+		if (ret == 0)
+			return -ETIMEDOUT;
+		else if (ret < 0)
+			return ret;
+
+		mutex_lock(&di->lock);
+	}
+
+	if (di->poll_state == POLL_STATE_ERROR) {
+		mutex_unlock(&di->lock);
+		return -EIO;
+	}
+
+	bool was_polled = di->was_polled;
+	di->was_polled = true;
+
+	*status = di->pm_status;
+	mutex_unlock(&di->lock);
+
+	if (!was_polled) {
+		dev_info(&di->psy->dev, "initial battery status: %d\n",
+			 status->online);
+
+		if (status->online) {
+			cpufreq_set_max_freq(CPUFREQ_MAX_FREQ_HIGH);
+		} else {
+			cpufreq_set_max_freq(CPUFREQ_MAX_FREQ_LOW);
+		}
+	}
+
+	return 0;
+}
+
+static int vcb2_pm_poll(struct vcb2_pm_device_info *di,
+			struct vcb2_pm_status *status)
+{
+	static const char poll_msg[] = { 'p', 'o', 'l', 'l', '\n' };
+	int ret;
+
+	mutex_lock(&di->lock);
+	if (vcb2_pm_has_cached_status_unlocked(di)) {
+		*status = di->pm_status;
+		mutex_unlock(&di->lock);
+		return 0;
+	} else if (vcb2_pm_is_poll_in_progress_unlocked(di)) {
+		/* Poll already in progress; piggypack on it */
+		mutex_unlock(&di->lock);
+	} else {
+		di->poll_state = POLL_STATE_IN_PROGRESS;
+		di->poll_time = get_jiffies_64();
+		mutex_unlock(&di->lock);
+
+		ret = serdev_device_write(di->serdev, poll_msg,
+					  sizeof(poll_msg),
+					  msecs_to_jiffies(SERIAL_TIMEOUT_MS));
+		if (ret < 0)
+			return ret;
+
+		if (ret < sizeof(poll_msg)) {
+			/*
+                         * This only happens when a singal or timeout was 
+                         * received after some bytes were already written.
+                         * This should never happen because only one poll
+                         * message can be in flight at a time and we are only
+                         * writing a very small buffer.
+                         */
+			return -EINTR;
+		}
+	}
+	return vcb2_pm_await_poll_response(di, status);
+}
+
+static int vcb2_pm_serial_recv(struct serdev_device *serdev,
+			       const unsigned char *buffer, size_t size)
+{
+	struct vcb2_pm_device_info *di = serdev_device_get_drvdata(serdev);
+	enum vcb2_pm_status_parser_ret ret;
+	bool should_wakup = false;
+
+	for (int i = 0; i < size; i++) {
+		ret = vcb2_pm_status_parser_feed(&di->status_parser, buffer[i]);
+		switch (ret) {
+		case PARSER_RET_INCOMPLETE:
+			break;
+		case PARSER_RET_ERROR:
+			dev_err(&serdev->dev,
+				"error while parsing PM status response\n");
+
+			mutex_lock(&di->lock);
+			di->poll_state = POLL_STATE_ERROR;
+			mutex_unlock(&di->lock);
+
+			should_wakup = true;
+			break;
+		case PARSER_RET_COMPLETE_STATUS:
+			mutex_lock(&di->lock);
+			di->poll_state = POLL_STATE_COMPLETED;
+			di->pm_status = di->status_parser.status;
+			di->poll_time = get_jiffies_64();
+			mutex_unlock(&di->lock);
+
+			should_wakup = true;
+			break;
+		case PARSER_RET_COMPLETE_SHUTDOWN_REQUEST:
+			dev_info(&serdev->dev, "shutdown requested\n");
+			mutex_lock(&di->lock);
+			initiate_shutdown_unlocked(di);
+			mutex_unlock(&di->lock);
+			break;
+		case PARSER_RET_COMPLETE_PING:
+			static const char ping_msg[] = { 'p', '\n' };
+
+			dev_info(&serdev->dev, "ping received\n");
+			ret = serdev_device_write(
+				di->serdev, ping_msg, sizeof(ping_msg),
+				msecs_to_jiffies(SERIAL_TIMEOUT_MS));
+
+			if (ret != sizeof(ping_msg))
+				dev_err(&serdev->dev, "failed to send pong\n");
+
+			break;
+		case PARSER_RET_COMPLETE_EXT_POWER_UP:
+			mdelay(100);
+			cpufreq_set_max_freq(CPUFREQ_MAX_FREQ_HIGH);
+			break;
+		case PARSER_RET_COMPLETE_EXT_POWER_DOWN:
+			cpufreq_set_max_freq(CPUFREQ_MAX_FREQ_LOW);
+			break;
+		}
+	}
+
+	if (should_wakup)
+		wake_up_all(&di->wq);
+
+	return size;
+}
+
+static int vcb2_pm_psy_get_property(struct power_supply *psy,
+				    enum power_supply_property psp,
+				    union power_supply_propval *val)
+{
+	struct vcb2_pm_device_info *di;
+	struct vcb2_pm_status pm_status;
+	int res;
+
+	di = power_supply_get_drvdata(psy);
+	res = vcb2_pm_poll(di, &pm_status);
+	if (res)
+		return res;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		if (pm_status.online) {
+			switch (pm_status.charge_status) {
+			case CHARGE_STATUS_NOT_CHARGING:
+				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+				break;
+			case CHARGE_STATUS_CHARGING:
+				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+				break;
+			case CHARGE_STATUS_FULL:
+				val->intval = POWER_SUPPLY_STATUS_FULL;
+				break;
+			default:
+				return -EINVAL;
+			}
+		} else {
+			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		}
+		break;
+	case POWER_SUPPLY_PROP_ONLINE:
+		val->intval = pm_status.online;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		val->intval = pm_status.bat_percent;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+		if (pm_status.bat_percent >= 90)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+		else if (pm_status.bat_percent >= 70)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
+		else if (pm_status.bat_percent >= 40)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+		else if (pm_status.bat_percent >= 10)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+		else
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		val->intval = pm_status.bat_voltage * 1000;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = pm_status.bat_current * 1000;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static ssize_t show_shutdown_requested(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct vcb2_pm_device_info *di =
+		power_supply_get_drvdata(to_power_supply(dev));
+	return sysfs_emit(buf, "%d\n", di->shutdown_requested);
+}
+
+int vcb2_pm_sys_off_handler(struct sys_off_data *data)
+{
+	static const char shutdown_msg[] = { 'o', 'f', 'f', '\n' };
+	struct serdev_device *serdev;
+	int ret;
+
+	serdev = data->cb_data;
+	ret = serdev_device_write(serdev, shutdown_msg, sizeof(shutdown_msg),
+				  msecs_to_jiffies(1000));
+
+	if (ret != sizeof(shutdown_msg)) {
+		dev_err(&serdev->dev, "error sending shutdown message\n");
+	}
+
+	serdev_device_wait_until_sent(serdev,
+				      msecs_to_jiffies(SERIAL_TIMEOUT_MS));
+
+	return NOTIFY_DONE;
+}
+
+static const struct serdev_device_ops vcb2_pm_ops = {
+	.receive_buf = vcb2_pm_serial_recv,
+	.write_wakeup = serdev_device_write_wakeup,
+};
+
+static int vcb2_pm_setup_serdev(struct vcb2_pm_device_info *di,
+				struct serdev_device *serdev)
+{
+	int ret;
+	uint baudrate;
+
+	ret = serdev_device_open(serdev);
+	if (ret) {
+		dev_err(&serdev->dev, "error opening serial port\n");
+		return -ret;
+	}
+
+	baudrate = serdev_device_set_baudrate(serdev, SERIAL_BAUDRATE);
+	if (baudrate != SERIAL_BAUDRATE) {
+		dev_err(&serdev->dev, "error setting baud rate\n");
+		ret = -EINVAL;
+		goto err;
+	}
+
+	ret = serdev_device_set_parity(serdev, SERDEV_PARITY_NONE);
+	if (ret) {
+		dev_err(&serdev->dev, "error setting parity\n");
+		goto err;
+	}
+
+	serdev_device_set_flow_control(serdev, false);
+	serdev_device_set_client_ops(serdev, &vcb2_pm_ops);
+
+	di->serdev = serdev;
+	dev_set_drvdata(&serdev->dev, di);
+	return 0;
+
+err:
+	serdev_device_close(serdev);
+	return ret;
+}
+
+static int vcb2_pm_setup_psy(struct vcb2_pm_device_info *di)
+{
+	/* sysfs attributes for custom properties */
+	static struct device_attribute dev_attr_shutdown_requested =
+		__ATTR(shutdown_requested, 0444, show_shutdown_requested, NULL);
+
+	static struct attribute *vcb2_pm_sysfs_entries[] = {
+		&dev_attr_shutdown_requested.attr,
+		NULL,
+	};
+
+	static const struct attribute_group vcb2_pm_attr_group = {
+		.name = NULL, /* put in device directory */
+		.attrs = vcb2_pm_sysfs_entries,
+	};
+
+	static const struct attribute_group *vcb2_pm_attr_groups[] = {
+		&vcb2_pm_attr_group,
+		NULL,
+	};
+
+	/* Standard properties */
+	static enum power_supply_property psy_props[] = {
+		POWER_SUPPLY_PROP_STATUS,      POWER_SUPPLY_PROP_ONLINE,
+		POWER_SUPPLY_PROP_CAPACITY,    POWER_SUPPLY_PROP_CAPACITY_LEVEL,
+		POWER_SUPPLY_PROP_VOLTAGE_NOW, POWER_SUPPLY_PROP_CURRENT_NOW,
+	};
+
+	struct power_supply_config psy_cfg = {
+		.drv_data = di,
+		.of_node = di->serdev->dev.of_node,
+		.attr_grp = vcb2_pm_attr_groups,
+	};
+
+	struct power_supply_desc *psy_desc =
+		devm_kzalloc(&di->serdev->dev, sizeof(*psy_desc), GFP_KERNEL);
+
+	if (!psy_desc)
+		return -ENOMEM;
+
+	psy_desc->name = "vcb2-pm";
+	psy_desc->type = POWER_SUPPLY_TYPE_BATTERY;
+	psy_desc->properties = psy_props;
+	psy_desc->num_properties = ARRAY_SIZE(psy_props);
+	psy_desc->get_property = vcb2_pm_psy_get_property;
+
+	di->psy = devm_power_supply_register(&di->serdev->dev, psy_desc,
+					     &psy_cfg);
+
+	if (IS_ERR(di->psy))
+		return PTR_ERR(di->psy);
+
+	return 0;
+}
+
+static int vcb2_pm_probe(struct serdev_device *serdev)
+{
+	struct vcb2_pm_device_info *di;
+	int ret;
+
+	di = devm_kzalloc(&serdev->dev, sizeof(*di), GFP_KERNEL);
+	if (!di)
+		return -ENOMEM;
+
+	vcb2_pm_di_init(di);
+
+	ret = vcb2_pm_setup_serdev(di, serdev);
+	if (ret) {
+		dev_err(&serdev->dev, "error setting up serial\n");
+		return ret;
+	}
+
+	ret = vcb2_pm_setup_psy(di);
+	if (ret) {
+		dev_err(&di->psy->dev, "error registering power supply\n");
+		goto err;
+	}
+
+	ret = devm_register_sys_off_handler(&serdev->dev,
+					    SYS_OFF_MODE_POWER_OFF_PREPARE,
+					    SYS_OFF_PRIO_DEFAULT,
+					    vcb2_pm_sys_off_handler, serdev);
+
+	if (ret) {
+		dev_err(&serdev->dev, "error registering power off handler\n");
+		goto err;
+	}
+
+	dev_info(&di->psy->dev, "power supply registered\n");
+	return 0;
+
+err:
+	serdev_device_close(serdev);
+	return ret;
+}
+
+static void vcb2_pm_remove(struct serdev_device *serdev)
+{
+	serdev_device_close(serdev);
+}
+
+static struct of_device_id vcb2_pm_ids[] = { { .compatible = "viv,vcb2-pm" },
+					     {} };
+
+MODULE_DEVICE_TABLE(of, vcb2_pm_ids);
+
+static struct serdev_device_driver
+	vcb2_pm_driver = { .probe = vcb2_pm_probe,
+			   .remove = vcb2_pm_remove,
+			   .driver = {
+				   .name = "vcb2-pm",
+				   .of_match_table = vcb2_pm_ids,
+			   } };
+
+static int __init vcb2_pm_mod_init(void)
+{
+	printk("VCB2-PM: Initializing module\n");
+
+	if (serdev_device_driver_register(&vcb2_pm_driver)) {
+		printk("vcb2-pm - could not load driver\n");
+		return -1;
+	}
+	return 0;
+}
+
+static void __exit vcb2_pm_mod_exit(void)
+{
+	serdev_device_driver_unregister(&vcb2_pm_driver);
+}
+
+module_init(vcb2_pm_mod_init);
+module_exit(vcb2_pm_mod_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Daniel Strittmatter");
+MODULE_DESCRIPTION("Viviana Cloud Box 2 Power Management Driver");

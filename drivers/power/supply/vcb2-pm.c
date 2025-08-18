@@ -37,10 +37,12 @@ struct vcb2_pm_status {
 	u16 bat_current;
 	u8 bat_percent;
 	bool online;
+	bool has_error;
 };
 
 void vcb2_pm_status_init(struct vcb2_pm_status *status)
 {
+	status->has_error = false;
 	status->online = false;
 	status->charge_status = CHARGE_STATUS_NOT_CHARGING;
 	status->bat_percent = 0;
@@ -325,10 +327,21 @@ static int vcb2_pm_await_poll_response(struct vcb2_pm_device_info *di,
 			di->wq, di->poll_state != POLL_STATE_IN_PROGRESS,
 			msecs_to_jiffies(SERIAL_TIMEOUT_MS));
 
-		if (ret == 0)
-			return -ETIMEDOUT;
-		else if (ret < 0)
+		if (ret == 0) {
+			// Returning -ETIMEDOUT would be logical here, but we don't want to
+			// stop the kernel from booting if the PM status is not available.
+			// return -ETIMEDOUT;
+
+			// Set the status to an error state and return 0 ("success")
+			vcb2_pm_status_init(status);
+			status->has_error = true;
+			mutex_lock(&di->lock);
+			di->pm_status = *status;
+			mutex_unlock(&di->lock);
+			return 0;
+		} else if (ret < 0) {
 			return ret;
+		}
 
 		mutex_lock(&di->lock);
 	}
@@ -534,6 +547,14 @@ static ssize_t show_shutdown_requested(struct device *dev,
 	return sysfs_emit(buf, "%d\n", di->shutdown_requested);
 }
 
+static ssize_t show_has_error(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct vcb2_pm_device_info *di =
+		power_supply_get_drvdata(to_power_supply(dev));
+	return sysfs_emit(buf, "%d\n", di->pm_status.has_error);
+}
+
 int vcb2_pm_sys_off_handler(struct sys_off_data *data)
 {
 	static const char shutdown_msg[] = { 'o', 'f', 'f', '\n' };
@@ -602,8 +623,12 @@ static int vcb2_pm_setup_psy(struct vcb2_pm_device_info *di)
 	static struct device_attribute dev_attr_shutdown_requested =
 		__ATTR(shutdown_requested, 0444, show_shutdown_requested, NULL);
 
+	static struct device_attribute dev_attr_has_error =
+		__ATTR(has_error, 0444, show_has_error, NULL);
+
 	static struct attribute *vcb2_pm_sysfs_entries[] = {
 		&dev_attr_shutdown_requested.attr,
+		&dev_attr_has_error.attr,
 		NULL,
 	};
 

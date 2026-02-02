@@ -36,6 +36,7 @@ struct vcb2_pm_status {
 	u16 bat_voltage;
 	u16 bat_current;
 	u8 bat_percent;
+	u8 led_state;
 	bool online;
 	bool has_error;
 };
@@ -48,6 +49,7 @@ void vcb2_pm_status_init(struct vcb2_pm_status *status)
 	status->bat_percent = 0;
 	status->bat_voltage = 0;
 	status->bat_current = 0;
+	status->led_state = 0;
 }
 
 struct vcb2_pm_status_parser {
@@ -61,6 +63,7 @@ struct vcb2_pm_status_parser {
 		PARSER_STATE_PERCENT,
 		PARSER_STATE_VOLTAGE,
 		PARSER_STATE_CURRENT,
+		PARSER_STATE_LED_STATUS,
 	} state;
 
 	struct vcb2_pm_status status;
@@ -250,6 +253,17 @@ vcb2_pm_status_parser_feed(struct vcb2_pm_status_parser *p, const char c)
 				(p->status.bat_current * 10) + (u16)(c - '0');
 		else if (c == '\n')
 			ret = PARSER_RET_COMPLETE_STATUS;
+		else if (c == ',')
+			p->state = PARSER_STATE_LED_STATUS;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_LED_STATUS:
+		if (c >= '0' && c <= '9')
+			p->status.led_state =
+				(p->status.led_state * 10) + (u8)(c - '0');
+		else if (c == '\n')
+			ret = PARSER_RET_COMPLETE_STATUS;
 		else
 			ret = PARSER_RET_ERROR;
 		break;
@@ -424,7 +438,8 @@ static int vcb2_pm_serial_recv(struct serdev_device *serdev,
 			break;
 		case PARSER_RET_ERROR:
 			dev_err(&serdev->dev,
-				"error while parsing PM status response\n");
+				"error while parsing PM status response: %s\n",
+				buffer);
 
 			mutex_lock(&di->lock);
 			di->poll_state = POLL_STATE_ERROR;
@@ -555,6 +570,36 @@ static ssize_t show_has_error(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%d\n", di->pm_status.has_error);
 }
 
+static ssize_t show_led_state(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct vcb2_pm_device_info *di =
+		power_supply_get_drvdata(to_power_supply(dev));
+
+	switch (di->pm_status.led_state) {
+	case 2:
+		return sysfs_emit(buf, "RUNNING_BAT_FULL\n");
+	case 3:
+		return sysfs_emit(buf, "OFF_BAT_FULL\n");
+	case 4:
+		return sysfs_emit(buf, "RUNNING_CHARGING\n");
+	case 5:
+		return sysfs_emit(buf, "OFF_CHARGING\n");
+	case 6:
+		return sysfs_emit(buf, "LOW_EXT_POWER\n");
+	case 7:
+		return sysfs_emit(buf, "BAT_CRITICAL\n");
+	case 8:
+		return sysfs_emit(buf, "RUNNING_ON_BAT\n");
+	case 9:
+		return sysfs_emit(buf, "BAT_DEAD\n");
+	case 10:
+		return sysfs_emit(buf, "OFF\n");
+	default:
+		return sysfs_emit(buf, "UNKNOWN\n");
+	}
+}
+
 int vcb2_pm_sys_off_handler(struct sys_off_data *data)
 {
 	static const char shutdown_msg[] = { 'o', 'f', 'f', '\n' };
@@ -626,9 +671,13 @@ static int vcb2_pm_setup_psy(struct vcb2_pm_device_info *di)
 	static struct device_attribute dev_attr_has_error =
 		__ATTR(has_error, 0444, show_has_error, NULL);
 
+	static struct device_attribute dev_attr_led_state =
+		__ATTR(led_state, 0444, show_led_state, NULL);
+
 	static struct attribute *vcb2_pm_sysfs_entries[] = {
 		&dev_attr_shutdown_requested.attr,
 		&dev_attr_has_error.attr,
+		&dev_attr_led_state.attr,
 		NULL,
 	};
 

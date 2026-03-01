@@ -1,6 +1,9 @@
 /dts-v1/;
 /plugin/;
 
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
 / {
 	metadata {
 		title = "Enable spidev on SPI1-M1 over CS0";
@@ -18,8 +21,9 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			pinctrl-names = "default";
-			pinctrl-0 = <&spi1m1_cs0 &spi1m1_pins>;
+			pinctrl-0 = <&spi1m1_pins>;
 			max-freq = <50000000>;
+			cs-gpios = <>;
 
 			spidev@0 {
 				compatible = "rockchip,spidev";

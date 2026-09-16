@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VCB2_LCD_LOGO
+	tristate "VCB2 ST7789 boot logo"
+	depends on SPI && GPIOLIB && OF
+	imply SPI_SPIDEV
+	default y
+	help
+	  Paints a static logo on the 240x240 ST7789 SPI panel of the
+	  Viviana CloudBox 2 during early boot (no framebuffer, no DRM).
+	  Binds to "viviana,st7789-logo" from the rk3588-vcb2-lcd overlay.
+
+	  Built in (Y), the logo appears before the initramfs runs. Userspace
+	  takes the panel over by unbinding the driver and binding spidev.

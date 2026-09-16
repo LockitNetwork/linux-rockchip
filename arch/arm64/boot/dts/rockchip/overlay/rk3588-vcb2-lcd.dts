@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// st7789_logo_overlay.dts — Device Tree overlay for BananaPi M7 (RK3588)
+//
+// Hardware connections (from main.go):
+//   SPI1  CS0  40 MHz  Mode3
+//   GPIO109 = RESET  (bank3 pin13 = GPIO3_B5)
+//   GPIO115 = DC     (bank3 pin19 = GPIO3_C3)
+//   GPIO100 = BL     (bank3 pin4  = GPIO3_A4)
+//   GPIO0   = CS     (GPIO0_A0, managed by SPI controller as CS0)
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/ {
+	compatible = "rockchip,rk3588";
+};
+
+&spi1 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	st7789_logo: st7789-logo@0 {
+		compatible = "viviana,st7789-logo";
+		reg = <0>;                          /* CS0 */
+
+		spi-max-frequency = <40000000>;
+		spi-cpol;                           /* Mode 3: CPOL=1 */
+		spi-cpha;                           /* Mode 3: CPHA=1 */
+
+		/* GPIO109 = GPIO3 bank, pin 13 = B5 */
+		reset-gpios = <&gpio3 RK_PB5 GPIO_ACTIVE_LOW>;
+
+		/* GPIO115 = GPIO3 bank, pin 19 = C3 */
+		dc-gpios    = <&gpio3 RK_PC3 GPIO_ACTIVE_HIGH>;
+
+		/* GPIO100 = GPIO3 bank, pin 4 = A4 */
+		bl-gpios    = <&gpio3 RK_PA4 GPIO_ACTIVE_HIGH>;
+	};
+};

@@ -5,6 +5,7 @@
 
 menu "Misc devices"
 
+source "drivers/misc/vcb2-lcd-logo/Kconfig"
 source "drivers/misc/rk628/Kconfig"
 
 config RK803

@@ -1,0 +1,2 @@
+# *.bin is ignored tree-wide; the logo pixels are a source file here.
+!logo.bin
